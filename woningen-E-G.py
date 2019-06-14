@@ -5,7 +5,12 @@ from xmlresource import XMLResource
 from stringuri import StringURI
 import uuid
 import sys
+import re
 
+gas_to_heat_efficiency = 0.9
+kwh_to_tj = 3.6e-6
+gas_energy_content = 35.17 # MJ/m3
+mega_to_terra = 1e6
 gas_heater_efficiency = 0.9
 gas_heater_power = 10000000.0
 elec_prod_mc = 0.9
@@ -24,17 +29,19 @@ influx_database = "energy_profiles"
 influx_filters = ""
 elec_measurement = "nedu_elektriciteit_2015-2018"
 elec_field = "E1A"
+elec_field_comp = "E3A"     # Assume offices, shops, education
 gas_measurement = "nedu_aardgas_2015-2018"
 gas_field = "G1A"
+gas_field_comp = "G2A"
 
 
 def ci2s(cell):
     return str(int(cell.value))
 
 
-def excel_to_ESDL(fname, sname):
+def excel_to_ESDL(fname, sname_woningen, sname_bedrijven):
     book = open_workbook(fname)
-    sheet = book.sheet_by_name(sname)
+    sheet = book.sheet_by_name(sname_woningen)
 
     top_area_type = str(sheet.cell(0, 3).value)
     if top_area_type == 'GM':
@@ -79,7 +86,7 @@ def excel_to_ESDL(fname, sname):
     carrs.carrier.append(elec_car)
 
     gas_car = esdl.EnergyCarrier(id='GAS', name='Natural Gas', emission=1.788225, energyContent=35.1700000, energyCarrierType='FOSSIL')
-    gas_car.emissionUnit = esdl.QuantityAndUnitType(physicalQuantity='EMISSION', multiplier='KILO', unit='GRAM', perMultiplier='GIGA', perUnit='JOULE')
+    gas_car.emissionUnit = esdl.QuantityAndUnitType(physicalQuantity='EMISSION', multiplier='KILO', unit='GRAM', perUnit='CUBIC_METRE')
     gas_car.energyContentUnit = esdl.QuantityAndUnitType(physicalQuantity='ENERGY', multiplier='MEGA', unit='JOULE', perUnit='CUBIC_METRE')
     carrs.carrier.append(gas_car)
 
@@ -87,6 +94,8 @@ def excel_to_ESDL(fname, sname):
     carrs.carrier.append(heat_comm)
 
     es.energySystemInformation = esdl.EnergySystemInformation(id=str(uuid.uuid4()), carriers=carrs)
+
+    srvs = esdl.Services()
 
     inst = esdl.Instance(id = str(uuid.uuid4()), name = top_area_name + ' ' + top_area_year)
     es.instance.append(inst)
@@ -102,7 +111,7 @@ def excel_to_ESDL(fname, sname):
     gep_ci = esdl.CostInformation(marginalCosts=gep_mc)
     gep_op = esdl.OutPort(id=str(uuid.uuid4()), name='EOut', connectedTo=[elec_nw_ip], carrier=elec_car)
     gep = esdl.GenericProducer(id=str(uuid.uuid4()), name='Unlimited Electricity Generation', port=[gep_op],
-                               power=gep_power, costInformation=gep_ci)
+                               power=gep_power, costInformation=gep_ci, prodType=esdl.RenewableTypeEnum.FOSSIL)
     ar.asset.append(gep)
     gec_mc = esdl.SingleValue(id=str(uuid.uuid4()), name='MarginalCosts', value=elec_cons_mc)
     gec_ci = esdl.CostInformation(marginalCosts=gec_mc)
@@ -118,9 +127,9 @@ def excel_to_ESDL(fname, sname):
 
     ggp_mc = esdl.SingleValue(id=str(uuid.uuid4()), name='MarginalCosts', value=gas_prod_mc)
     ggp_ci = esdl.CostInformation(marginalCosts=ggp_mc)
-    ggp_op = esdl.OutPort(id=str(uuid.uuid4()), name='EOut', connectedTo=[gas_nw_ip], carrier=elec_car)
+    ggp_op = esdl.OutPort(id=str(uuid.uuid4()), name='GOut', connectedTo=[gas_nw_ip], carrier=gas_car)
     ggp = esdl.GenericProducer(id=str(uuid.uuid4()), name='Unlimited Gas Generation', port=[ggp_op],
-                               power=ggp_power, costInformation=ggp_ci)
+                               power=ggp_power, costInformation=ggp_ci, prodType=esdl.RenewableTypeEnum.FOSSIL)
     ar.asset.append(ggp)
     # ggc_mc = esdl.SingleValue(id=str(uuid.uuid4()), name='MarginalCosts', value=gas_cons_mc)
     # ggc_ci = esdl.CostInformation(marginalCosts=ggc_mc)
@@ -139,7 +148,7 @@ def excel_to_ESDL(fname, sname):
 
         sub_area = esdl.Area(id=sub_area_id, name=sub_area_name, scope=sub_aggr_scope)
 
-        #aggr_build = esdl.AggregatedBuilding(id=str(uuid.uuid4()), name="building")
+        aggr_build = esdl.AggregatedBuilding(id=str(uuid.uuid4()), name="building")
 
         hdprofqau = esdl.QuantityAndUnitType(physicalQuantity='ENERGY', multiplier='TERRA', unit='JOULE')
         hdprof = esdl.InfluxDBProfile(id=str(uuid.uuid4()), multiplier=heat_value, host=influx_host,
@@ -154,6 +163,9 @@ def excel_to_ESDL(fname, sname):
         gh = esdl.GasHeater(id=str(uuid.uuid4()), name='GasHeater_'+sub_area_id, efficiency=gas_heater_efficiency,
                             power=gas_heater_power, port=[ghip, ghop])
 
+        dbd = esdl.DrivenByDemand(id=str(uuid.uuid4()), name='DBD_GasHeater_'+sub_area_id, energyAsset=gh, outPort=ghop)
+        srvs.service.append(dbd)
+
         edprofqau = esdl.QuantityAndUnitType(physicalQuantity='ENERGY', multiplier='TERRA', unit='JOULE')
         edprof = esdl.InfluxDBProfile(id=str(uuid.uuid4()), multiplier=elec_value, host=influx_host,
                                       port=influx_port, database=influx_database, filters=influx_filters,
@@ -162,16 +174,70 @@ def excel_to_ESDL(fname, sname):
         edip = esdl.InPort(id=str(uuid.uuid4()), name='InPort', connectedTo=[elec_nw_op], carrier=elec_car, profile=edprof)
         ed = esdl.ElectricityDemand(id=str(uuid.uuid4()), name='ElectricityDemand_'+sub_area_id, port=[edip])
 
-        sub_area.asset.append(hd)
-        sub_area.asset.append(gh)
-        sub_area.asset.append(ed)
+        #sub_area.asset.append(hd)
+        #sub_area.asset.append(gh)
+        #sub_area.asset.append(ed)
 
-        #aggr_build.asset.append(hd)
-        #aggr_build.asset.append(gh)
-        #aggr_build.asset.append(ed)
-        #sub_area.asset.append(aggr_build)
+        aggr_build.asset.append(hd)
+        aggr_build.asset.append(gh)
+        aggr_build.asset.append(ed)
+        sub_area.asset.append(aggr_build)
 
         ar.area.append(sub_area)
+
+
+    sheet = book.sheet_by_name(sname_bedrijven)
+    aggr_build_comp = esdl.AggregatedBuilding(id=str(uuid.uuid4()), name="building-bedrijven")
+
+    for row in range(2, sheet.nrows-3):
+        cat = sheet.cell(row, 0).value
+        waarde = sheet.cell(row, 1).value
+
+        if cat != '' and waarde != 0 and waarde != '?':     # filter non relevant data
+            cat = re.sub(' ', '_', cat)
+            print(cat, waarde)
+
+            if cat.find('m3') != -1:        # category contains gasusage
+                gas_tj = waarde * gas_energy_content / mega_to_terra
+                heat_tj = gas_tj * gas_to_heat_efficiency
+
+                hdbprofqau = esdl.QuantityAndUnitType(physicalQuantity='ENERGY', multiplier='TERRA', unit='JOULE')
+                hdbprof = esdl.InfluxDBProfile(id=str(uuid.uuid4()), multiplier=heat_tj, host=influx_host,
+                                              port=influx_port, database=influx_database, filters=influx_filters,
+                                              measurement=gas_measurement, field=gas_field_comp,
+                                              profileQuantityAndUnit=hdbprofqau,
+                                              profileType='ENERGY_IN_TJ')
+                hdbip = esdl.InPort(id=str(uuid.uuid4()), name='InPort', carrier=heat_comm, profile=hdbprof)
+                hdb = esdl.HeatingDemand(id=str(uuid.uuid4()), name='HeatingDemand_' + cat, port=[hdbip])
+
+                ghbip = esdl.InPort(id=str(uuid.uuid4()), name='InPort', connectedTo=[gas_nw_op], carrier=gas_car)
+                ghbop = esdl.OutPort(id=str(uuid.uuid4()), name='OutPort', connectedTo=[hdbip], carrier=heat_comm)
+                ghb = esdl.GasHeater(id=str(uuid.uuid4()), name='GasHeater_' + cat, efficiency=gas_heater_efficiency,
+                                    power=gas_heater_power, port=[ghbip, ghbop])
+
+                aggr_build_comp.asset.append(hdb)
+                aggr_build_comp.asset.append(ghb)
+
+                dbd = esdl.DrivenByDemand(id=str(uuid.uuid4()), name='DBD_GasHeater_' + cat, energyAsset=ghb,
+                                          outPort=ghbop)
+                srvs.service.append(dbd)
+
+            if cat.find('kWh') != -1:       # category contains electricity usage
+                elec_tj = waarde * kwh_to_tj
+
+                edbprofqau = esdl.QuantityAndUnitType(physicalQuantity='ENERGY', multiplier='TERRA', unit='JOULE')
+                edbprof = esdl.InfluxDBProfile(id=str(uuid.uuid4()), multiplier=elec_tj, host=influx_host,
+                                              port=influx_port, database=influx_database, filters=influx_filters,
+                                              measurement=elec_measurement, field=elec_field_comp, profileQuantityAndUnit=edbprofqau,
+                                              profileType='ENERGY_IN_TJ')
+                edbip = esdl.InPort(id=str(uuid.uuid4()), name='InPort', connectedTo=[elec_nw_op], carrier=elec_car, profile=edbprof)
+                edb = esdl.ElectricityDemand(id=str(uuid.uuid4()), name='ElectricityDemand_'+cat, port=[edbip])
+
+                aggr_build_comp.asset.append(edb)
+
+    ar.asset.append(aggr_build_comp)
+
+    es.services = srvs
 
     rset = ResourceSet()
     rset.resource_factory['esdl'] = lambda uri: XMLResource(uri)
@@ -184,9 +250,10 @@ def excel_to_ESDL(fname, sname):
 def main():
 
     fname = './data/Klimaatmonitor - Emmen.xls'
-    sname = 'Totaal 2017 Wijken 2017 van Gem'
+    sname_won = 'Totaal 2017 Wijken 2017 van Gem'
+    sname_bedr = 'Thema s 2017 Emmen'
 
-    excel_to_ESDL(fname, sname)
+    excel_to_ESDL(fname, sname_won, sname_bedr)
 
 
 if __name__ == "__main__":
